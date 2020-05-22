@@ -15,6 +15,7 @@ package privileges_test
 
 import (
 	"fmt"
+
 	. "github.com/pingcap/check"
 	"github.com/pingcap/parser/auth"
 	"github.com/pingcap/parser/mysql"
@@ -33,7 +34,7 @@ type testCacheSuite struct {
 }
 
 func (s *testCacheSuite) SetUpSuite(c *C) {
-	store, err := mockstore.NewMockTikvStore()
+	store, err := mockstore.NewMockStore()
 	session.SetSchemaLease(0)
 	session.DisableStats4Test()
 	c.Assert(err, IsNil)
@@ -59,11 +60,11 @@ func (s *testCacheSuite) TestLoadUserTable(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(len(p.User), Equals, 0)
 
-	// Host | User | Password | Select_priv | Insert_priv | Update_priv | Delete_priv | Create_priv | Drop_priv | Process_priv | Grant_priv | References_priv | Alter_priv | Show_db_priv | Super_priv | Execute_priv | Index_priv | Create_user_priv | Trigger_priv
-	mustExec(c, se, `INSERT INTO mysql.user (Host, User, Password, Select_priv) VALUES ("%", "root", "", "Y")`)
-	mustExec(c, se, `INSERT INTO mysql.user (Host, User, Password, Insert_priv) VALUES ("%", "root1", "admin", "Y")`)
-	mustExec(c, se, `INSERT INTO mysql.user (Host, User, Password, Update_priv, Show_db_priv, References_priv) VALUES ("%", "root11", "", "Y", "Y", "Y")`)
-	mustExec(c, se, `INSERT INTO mysql.user (Host, User, Password, Create_user_priv, Index_priv, Execute_priv, Create_view_priv, Show_view_priv, Show_db_priv, Super_priv, Trigger_priv) VALUES ("%", "root111", "", "Y",  "Y", "Y", "Y", "Y", "Y", "Y", "Y")`)
+	// Host | User | authentication_string | Select_priv | Insert_priv | Update_priv | Delete_priv | Create_priv | Drop_priv | Process_priv | Grant_priv | References_priv | Alter_priv | Show_db_priv | Super_priv | Execute_priv | Index_priv | Create_user_priv | Trigger_priv
+	mustExec(c, se, `INSERT INTO mysql.user (Host, User, authentication_string, Select_priv) VALUES ("%", "root", "", "Y")`)
+	mustExec(c, se, `INSERT INTO mysql.user (Host, User, authentication_string, Insert_priv) VALUES ("%", "root1", "admin", "Y")`)
+	mustExec(c, se, `INSERT INTO mysql.user (Host, User, authentication_string, Update_priv, Show_db_priv, References_priv) VALUES ("%", "root11", "", "Y", "Y", "Y")`)
+	mustExec(c, se, `INSERT INTO mysql.user (Host, User, authentication_string, Create_user_priv, Index_priv, Execute_priv, Create_view_priv, Show_view_priv, Show_db_priv, Super_priv, Trigger_priv) VALUES ("%", "root111", "", "Y",  "Y", "Y", "Y", "Y", "Y", "Y", "Y")`)
 
 	p = privileges.MySQLPrivilege{}
 	err = p.LoadUserTable(se)
@@ -225,7 +226,7 @@ func (s *testCacheSuite) TestHostMatch(c *C) {
 	// Host name can be IPv4 address + netmask.
 	mustExec(c, se, "USE MYSQL;")
 	mustExec(c, se, "TRUNCATE TABLE mysql.user")
-	mustExec(c, se, `INSERT INTO mysql.user (HOST, USER, PASSWORD, Select_priv, Shutdown_priv) VALUES ("172.0.0.0/255.0.0.0", "root", "", "Y", "Y")`)
+	mustExec(c, se, `INSERT INTO mysql.user (HOST, USER, authentication_string, Select_priv, Shutdown_priv) VALUES ("172.0.0.0/255.0.0.0", "root", "", "Y", "Y")`)
 	var p privileges.MySQLPrivilege
 	err = p.LoadUserTable(se)
 	c.Assert(err, IsNil)
@@ -353,7 +354,7 @@ func (s *testCacheSuite) TestRoleGraphBFS(c *C) {
 }
 
 func (s *testCacheSuite) TestAbnormalMySQLTable(c *C) {
-	store, err := mockstore.NewMockTikvStore()
+	store, err := mockstore.NewMockStore()
 	c.Assert(err, IsNil)
 	defer store.Close()
 	session.SetSchemaLease(0)
@@ -384,6 +385,7 @@ func (s *testCacheSuite) TestAbnormalMySQLTable(c *C) {
   Shutdown_priv enum('N','Y') CHARACTER SET utf8 NOT NULL DEFAULT 'N',
   Process_priv enum('N','Y') CHARACTER SET utf8 NOT NULL DEFAULT 'N',
   File_priv enum('N','Y') CHARACTER SET utf8 NOT NULL DEFAULT 'N',
+  Config_priv enum('N','Y') CHARACTER SET utf8 NOT NULL DEFAULT 'N',
   Grant_priv enum('N','Y') CHARACTER SET utf8 NOT NULL DEFAULT 'N',
   References_priv enum('N','Y') CHARACTER SET utf8 NOT NULL DEFAULT 'N',
   Index_priv enum('N','Y') CHARACTER SET utf8 NOT NULL DEFAULT 'N',
@@ -419,7 +421,7 @@ func (s *testCacheSuite) TestAbnormalMySQLTable(c *C) {
   password_expired enum('N','Y') CHARACTER SET utf8 NOT NULL DEFAULT 'N',
   PRIMARY KEY (Host,User)
 ) ENGINE=MyISAM DEFAULT CHARSET=utf8 COLLATE=utf8_bin COMMENT='Users and global privileges';`)
-	mustExec(c, se, `INSERT INTO user VALUES ('localhost','root','','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','','','','',0,0,0,0,'mysql_native_password','','N');
+	mustExec(c, se, `INSERT INTO user VALUES ('localhost','root','','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','Y','','','','',0,0,0,0,'mysql_native_password','','N');
 `)
 	var p privileges.MySQLPrivilege
 	err = p.LoadUserTable(se)
@@ -551,6 +553,27 @@ func (s *testCacheSuite) TestDBIsVisible(c *C) {
 	err = p.LoadUserTable(se)
 	c.Assert(err, IsNil)
 	isVisible = p.DBIsVisible("testvisdb6", "%", "visdb")
+	c.Assert(isVisible, IsTrue)
+	mustExec(c, se, "TRUNCATE TABLE mysql.user")
+
+	mustExec(c, se, `INSERT INTO mysql.user (Host, User, Trigger_priv) VALUES ("%", "testvisdb7", "Y")`)
+	err = p.LoadUserTable(se)
+	c.Assert(err, IsNil)
+	isVisible = p.DBIsVisible("testvisdb7", "%", "visdb")
+	c.Assert(isVisible, IsTrue)
+	mustExec(c, se, "TRUNCATE TABLE mysql.user")
+
+	mustExec(c, se, `INSERT INTO mysql.user (Host, User, References_priv) VALUES ("%", "testvisdb8", "Y")`)
+	err = p.LoadUserTable(se)
+	c.Assert(err, IsNil)
+	isVisible = p.DBIsVisible("testvisdb8", "%", "visdb")
+	c.Assert(isVisible, IsTrue)
+	mustExec(c, se, "TRUNCATE TABLE mysql.user")
+
+	mustExec(c, se, `INSERT INTO mysql.user (Host, User, Execute_priv) VALUES ("%", "testvisdb9", "Y")`)
+	err = p.LoadUserTable(se)
+	c.Assert(err, IsNil)
+	isVisible = p.DBIsVisible("testvisdb9", "%", "visdb")
 	c.Assert(isVisible, IsTrue)
 	mustExec(c, se, "TRUNCATE TABLE mysql.user")
 }

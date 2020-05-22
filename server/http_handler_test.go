@@ -15,6 +15,9 @@ package server
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -32,10 +35,12 @@ import (
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	zaplog "github.com/pingcap/log"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/config"
+	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
@@ -46,7 +51,6 @@ import (
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/store/helper"
 	"github.com/pingcap/tidb/store/mockstore"
-	"github.com/pingcap/tidb/store/mockstore/mocktikv"
 	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
@@ -92,7 +96,7 @@ func (ts *HTTPHandlerTestSuite) TestRegionIndexRange(c *C) {
 
 	startKey := tablecodec.EncodeIndexSeekKey(sTableID, sIndex, encodedValue)
 	recordPrefix := tablecodec.GenTableRecordPrefix(eTableID)
-	endKey := tablecodec.EncodeRecordKey(recordPrefix, recordID)
+	endKey := tablecodec.EncodeRecordKey(recordPrefix, kv.IntHandle(recordID))
 
 	region := &tikv.KeyLocation{
 		Region:   tikv.RegionVerID{},
@@ -336,9 +340,8 @@ func (ts *HTTPHandlerTestSuite) TestRegionsFromMeta(c *C) {
 }
 
 func (ts *HTTPHandlerTestSuite) startServer(c *C) {
-	mvccStore := mocktikv.MustNewMVCCStore()
 	var err error
-	ts.store, err = mockstore.NewMockTikvStore(mockstore.WithMVCCStore(mvccStore))
+	ts.store, err = mockstore.NewMockStore()
 	c.Assert(err, IsNil)
 	ts.domain, err = session.BootstrapSession(ts.store)
 	c.Assert(err, IsNil)
@@ -439,7 +442,17 @@ func (ts *HTTPHandlerTestSuite) TestGetTableMVCC(c *C) {
 	info := data.Value.Info
 	c.Assert(info, NotNil)
 	c.Assert(len(info.Writes), Greater, 0)
-	startTs := info.Writes[0].StartTs
+
+	// TODO: Unistore will not return Op_Lock.
+	// Use this workaround to support two backend, we can remove this hack after deprecated mocktikv.
+	var startTs uint64
+	for _, w := range info.Writes {
+		if w.Type == kvrpcpb.Op_Lock {
+			continue
+		}
+		startTs = w.StartTs
+		break
+	}
 
 	resp, err = ts.fetchStatus(fmt.Sprintf("/mvcc/txn/%d/tidb/test", startTs))
 	c.Assert(err, IsNil)
@@ -505,6 +518,31 @@ func (ts *HTTPHandlerTestSuite) TestTiFlashReplica(c *C) {
 	ts.startServer(c)
 	ts.prepareData(c)
 	defer ts.stopServer(c)
+
+	db, err := sql.Open("mysql", ts.getDSN())
+	c.Assert(err, IsNil, Commentf("Error connecting"))
+	defer db.Close()
+	dbt := &DBTest{c, db}
+
+	defer func(originGC bool) {
+		if originGC {
+			ddl.EmulatorGCEnable()
+		} else {
+			ddl.EmulatorGCDisable()
+		}
+	}(ddl.IsEmulatorGCEnable())
+
+	// Disable emulator GC.
+	// Otherwise emulator GC will delete table record as soon as possible after execute drop table DDL.
+	ddl.EmulatorGCDisable()
+	gcTimeFormat := "20060102-15:04:05 -0700 MST"
+	timeBeforeDrop := time.Now().Add(0 - 48*60*60*time.Second).Format(gcTimeFormat)
+	safePointSQL := `INSERT HIGH_PRIORITY INTO mysql.tidb VALUES ('tikv_gc_safe_point', '%[1]s', ''),('tikv_gc_enable','true','')
+			       ON DUPLICATE KEY
+			       UPDATE variable_value = '%[1]s'`
+	// Set GC safe point and enable GC.
+	dbt.mustExec(fmt.Sprintf(safePointSQL, timeBeforeDrop))
+
 	resp, err := ts.fetchStatus("/tiflash/replica")
 	c.Assert(err, IsNil)
 	decoder := json.NewDecoder(resp.Body)
@@ -512,11 +550,6 @@ func (ts *HTTPHandlerTestSuite) TestTiFlashReplica(c *C) {
 	err = decoder.Decode(&data)
 	c.Assert(err, IsNil)
 	c.Assert(len(data), Equals, 0)
-
-	db, err := sql.Open("mysql", ts.getDSN())
-	c.Assert(err, IsNil, Commentf("Error connecting"))
-	defer db.Close()
-	dbt := &DBTest{c, db}
 
 	dbt.mustExec("use tidb")
 	dbt.mustExec("alter table test set tiflash replica 2 location labels 'a','b';")
@@ -553,6 +586,7 @@ func (ts *HTTPHandlerTestSuite) TestTiFlashReplica(c *C) {
 	decoder = json.NewDecoder(resp.Body)
 	err = decoder.Decode(&data)
 	c.Assert(err, IsNil)
+	resp.Body.Close()
 	c.Assert(len(data), Equals, 1)
 	c.Assert(data[0].ReplicaCount, Equals, uint64(2))
 	c.Assert(strings.Join(data[0].LocationLabels, ","), Equals, "a,b")
@@ -560,15 +594,91 @@ func (ts *HTTPHandlerTestSuite) TestTiFlashReplica(c *C) {
 
 	// Should not take effect.
 	dbt.mustExec("alter table test set tiflash replica 2 location labels 'a','b';")
+	checkFunc := func() {
+		resp, err = ts.fetchStatus("/tiflash/replica")
+		c.Assert(err, IsNil)
+		decoder = json.NewDecoder(resp.Body)
+		err = decoder.Decode(&data)
+		c.Assert(err, IsNil)
+		resp.Body.Close()
+		c.Assert(len(data), Equals, 1)
+		c.Assert(data[0].ReplicaCount, Equals, uint64(2))
+		c.Assert(strings.Join(data[0].LocationLabels, ","), Equals, "a,b")
+		c.Assert(data[0].Available, Equals, true) // The status should be true now.
+	}
+
+	// Test for get dropped table tiflash replica info.
+	dbt.mustExec("drop table test")
+	checkFunc()
+
+	// Test unique table id replica info.
+	dbt.mustExec("flashback table test")
+	checkFunc()
+	dbt.mustExec("drop table test")
+	checkFunc()
+	dbt.mustExec("flashback table test")
+	checkFunc()
+
+	// Test for partition table.
+	dbt.mustExec("alter table pt set tiflash replica 2 location labels 'a','b';")
+	dbt.mustExec("alter table test set tiflash replica 0;")
 	resp, err = ts.fetchStatus("/tiflash/replica")
 	c.Assert(err, IsNil)
 	decoder = json.NewDecoder(resp.Body)
 	err = decoder.Decode(&data)
 	c.Assert(err, IsNil)
-	c.Assert(len(data), Equals, 1)
+	resp.Body.Close()
+	c.Assert(len(data), Equals, 3)
 	c.Assert(data[0].ReplicaCount, Equals, uint64(2))
 	c.Assert(strings.Join(data[0].LocationLabels, ","), Equals, "a,b")
-	c.Assert(data[0].Available, Equals, true) // The status should be true now.
+	c.Assert(data[0].Available, Equals, false)
+
+	pid0 := data[0].ID
+	pid1 := data[1].ID
+	pid2 := data[2].ID
+
+	// Mock for partition 1 replica was available.
+	req = fmt.Sprintf(`{"id":%d,"region_count":3,"flash_region_count":3}`, pid1)
+	resp, err = ts.postStatus("/tiflash/replica", "application/json", bytes.NewBuffer([]byte(req)))
+	c.Assert(err, IsNil)
+	resp.Body.Close()
+	resp, err = ts.fetchStatus("/tiflash/replica")
+	c.Assert(err, IsNil)
+	decoder = json.NewDecoder(resp.Body)
+	err = decoder.Decode(&data)
+	c.Assert(err, IsNil)
+	resp.Body.Close()
+	c.Assert(len(data), Equals, 3)
+	c.Assert(data[0].Available, Equals, false)
+	c.Assert(data[1].Available, Equals, true)
+	c.Assert(data[2].Available, Equals, false)
+
+	// Mock for partition 0,2 replica was available.
+	req = fmt.Sprintf(`{"id":%d,"region_count":3,"flash_region_count":3}`, pid0)
+	resp, err = ts.postStatus("/tiflash/replica", "application/json", bytes.NewBuffer([]byte(req)))
+	c.Assert(err, IsNil)
+	resp.Body.Close()
+	req = fmt.Sprintf(`{"id":%d,"region_count":3,"flash_region_count":3}`, pid2)
+	resp, err = ts.postStatus("/tiflash/replica", "application/json", bytes.NewBuffer([]byte(req)))
+	c.Assert(err, IsNil)
+	resp.Body.Close()
+	checkFunc = func() {
+		resp, err = ts.fetchStatus("/tiflash/replica")
+		c.Assert(err, IsNil)
+		decoder = json.NewDecoder(resp.Body)
+		err = decoder.Decode(&data)
+		c.Assert(err, IsNil)
+		resp.Body.Close()
+		c.Assert(len(data), Equals, 3)
+		c.Assert(data[0].Available, Equals, true)
+		c.Assert(data[1].Available, Equals, true)
+		c.Assert(data[2].Available, Equals, true)
+	}
+
+	// Test for get truncated table tiflash replica info.
+	dbt.mustExec("truncate table pt")
+	dbt.mustExec("alter table pt set tiflash replica 0;")
+	checkFunc()
 }
 
 func (ts *HTTPHandlerTestSuite) TestDecodeColumnValue(c *C) {
@@ -720,7 +830,7 @@ func (ts *HTTPHandlerTestSuite) TestGetSchema(c *C) {
 	var dbs []*model.DBInfo
 	err = decoder.Decode(&dbs)
 	c.Assert(err, IsNil)
-	expects := []string{"information_schema", "inspection_schema", "metric_schema", "mysql", "performance_schema", "test", "tidb"}
+	expects := []string{"information_schema", "metrics_schema", "mysql", "performance_schema", "test", "tidb"}
 	names := make([]string, len(dbs))
 	for i, v := range dbs {
 		names[i] = v.Name.L
@@ -999,6 +1109,19 @@ func (ts *HTTPHandlerTestSuite) TestDebugZip(c *C) {
 	c.Assert(resp.Body.Close(), IsNil)
 }
 
+func (ts *HTTPHandlerTestSuite) TestCheckCN(c *C) {
+	s := &Server{cfg: &config.Config{Security: config.Security{ClusterVerifyCN: []string{"a ", "b", "c"}}}}
+	tlsConfig := &tls.Config{}
+	s.setCNChecker(tlsConfig)
+	c.Assert(tlsConfig.VerifyPeerCertificate, NotNil)
+	err := tlsConfig.VerifyPeerCertificate(nil, [][]*x509.Certificate{{{Subject: pkix.Name{CommonName: "a"}}}})
+	c.Assert(err, IsNil)
+	err = tlsConfig.VerifyPeerCertificate(nil, [][]*x509.Certificate{{{Subject: pkix.Name{CommonName: "b"}}}})
+	c.Assert(err, IsNil)
+	err = tlsConfig.VerifyPeerCertificate(nil, [][]*x509.Certificate{{{Subject: pkix.Name{CommonName: "d"}}}})
+	c.Assert(err, NotNil)
+}
+
 func (ts *HTTPHandlerTestSuite) TestZipInfoForSQL(c *C) {
 	ts.startServer(c)
 	defer ts.stopServer(c)
@@ -1054,5 +1177,27 @@ func (ts *HTTPHandlerTestSuite) TestZipInfoForSQL(c *C) {
 	b, err = ioutil.ReadAll(resp.Body)
 	c.Assert(err, IsNil)
 	c.Assert(string(b), Equals, "use database non_exists_db failed, err: [schema:1049]Unknown database 'non_exists_db'\n")
+	c.Assert(resp.Body.Close(), IsNil)
+}
+
+func (ts *HTTPHandlerTestSuite) TestFailpointHandler(c *C) {
+	defer ts.stopServer(c)
+
+	// start server without enabling failpoint integration
+	ts.startServer(c)
+	resp, err := ts.fetchStatus("/fail/")
+	c.Assert(err, IsNil)
+	c.Assert(resp.StatusCode, Equals, http.StatusNotFound)
+	ts.stopServer(c)
+
+	// enable failpoint integration and start server
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/server/integrateFailpoint", "return"), IsNil)
+	ts.startServer(c)
+	resp, err = ts.fetchStatus("/fail/")
+	c.Assert(err, IsNil)
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
+	b, err := ioutil.ReadAll(resp.Body)
+	c.Assert(err, IsNil)
+	c.Assert(strings.Contains(string(b), "github.com/pingcap/tidb/server/integrateFailpoint=return"), IsTrue)
 	c.Assert(resp.Body.Close(), IsNil)
 }

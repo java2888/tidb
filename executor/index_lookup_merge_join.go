@@ -26,9 +26,12 @@ import (
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/execdetails"
+	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/memory"
 	"github.com/pingcap/tidb/util/ranger"
 	"github.com/pingcap/tidb/util/stringutil"
+	"go.uber.org/zap"
 )
 
 // IndexLookUpMergeJoin realizes IndexLookUpJoin by merge join
@@ -159,10 +162,10 @@ func (e *IndexLookUpMergeJoin) Open(ctx context.Context) error {
 	// recordSet.Next()
 	// e.dataReaderBuilder.Build() // txn is used again, which is already closed
 	//
-	// The trick here is `getStartTS` will cache start ts in the dataReaderBuilder,
+	// The trick here is `getSnapshotTS` will cache snapshot ts in the dataReaderBuilder,
 	// so even txn is destroyed later, the dataReaderBuilder could still use the
-	// cached start ts to construct DAG.
-	_, err := e.innerMergeCtx.readerBuilder.getStartTS()
+	// cached snapshot ts to construct DAG.
+	_, err := e.innerMergeCtx.readerBuilder.getSnapshotTS()
 	if err != nil {
 		return err
 	}
@@ -171,7 +174,7 @@ func (e *IndexLookUpMergeJoin) Open(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	e.memTracker = memory.NewTracker(e.id, e.ctx.GetSessionVars().MemQuotaIndexLookupJoin)
+	e.memTracker = memory.NewTracker(e.id, -1)
 	e.memTracker.AttachTo(e.ctx.GetSessionVars().StmtCtx.MemTracker)
 	e.startWorkers(ctx)
 	return nil
@@ -295,6 +298,9 @@ func (omw *outerMergeWorker) run(ctx context.Context, wg *sync.WaitGroup, cancel
 		close(omw.innerCh)
 		wg.Done()
 		if r := recover(); r != nil {
+			logutil.Logger(ctx).Error("panic in outerMergeWorker.run",
+				zap.Reflect("r", r),
+				zap.Stack("stack trace"))
 			cancelFunc()
 		}
 	}()
@@ -383,6 +389,9 @@ func (imw *innerMergeWorker) run(ctx context.Context, wg *sync.WaitGroup, cancel
 	defer func() {
 		wg.Done()
 		if r := recover(); r != nil {
+			logutil.Logger(ctx).Error("panic in innerMergeWorker.run",
+				zap.Reflect("r", r),
+				zap.Stack("stack trace"))
 			cancelFunc()
 		}
 	}()
@@ -686,7 +695,7 @@ func (e *IndexLookUpMergeJoin) Close() error {
 	e.memTracker = nil
 	if e.runtimeStats != nil {
 		concurrency := cap(e.resultCh)
-		e.runtimeStats.SetConcurrencyInfo("Concurrency", concurrency)
+		e.runtimeStats.SetConcurrencyInfo(execdetails.NewConcurrencyInfo("Concurrency", concurrency))
 	}
 	return e.baseExecutor.Close()
 }

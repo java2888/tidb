@@ -68,6 +68,7 @@ const (
 
 	CmdCop CmdType = 512 + iota
 	CmdCopStream
+	CmdBatchCop
 
 	CmdMvccGetByKey CmdType = 1024 + iota
 	CmdMvccGetByStartTs
@@ -136,6 +137,8 @@ func (t CmdType) String() string {
 		return "Cop"
 	case CmdCopStream:
 		return "CopStream"
+	case CmdBatchCop:
+		return "BatchCop"
 	case CmdMvccGetByKey:
 		return "MvccGetByKey"
 	case CmdMvccGetByStartTs:
@@ -309,6 +312,11 @@ func (req *Request) Cop() *coprocessor.Request {
 	return req.req.(*coprocessor.Request)
 }
 
+// BatchCop returns coprocessor request in request.
+func (req *Request) BatchCop() *coprocessor.BatchRequest {
+	return req.req.(*coprocessor.BatchRequest)
+}
+
 // MvccGetByKey returns MvccGetByKeyRequest in request.
 func (req *Request) MvccGetByKey() *kvrpcpb.MvccGetByKeyRequest {
 	return req.req.(*kvrpcpb.MvccGetByKeyRequest)
@@ -426,60 +434,63 @@ type Response struct {
 }
 
 // FromBatchCommandsResponse converts a BatchCommands response to Response.
-func FromBatchCommandsResponse(res *tikvpb.BatchCommandsResponse_Response) *Response {
+func FromBatchCommandsResponse(res *tikvpb.BatchCommandsResponse_Response) (*Response, error) {
+	if res.GetCmd() == nil {
+		return nil, errors.New("Unknown command response")
+	}
 	switch res := res.GetCmd().(type) {
 	case *tikvpb.BatchCommandsResponse_Response_Get:
-		return &Response{Resp: res.Get}
+		return &Response{Resp: res.Get}, nil
 	case *tikvpb.BatchCommandsResponse_Response_Scan:
-		return &Response{Resp: res.Scan}
+		return &Response{Resp: res.Scan}, nil
 	case *tikvpb.BatchCommandsResponse_Response_Prewrite:
-		return &Response{Resp: res.Prewrite}
+		return &Response{Resp: res.Prewrite}, nil
 	case *tikvpb.BatchCommandsResponse_Response_Commit:
-		return &Response{Resp: res.Commit}
+		return &Response{Resp: res.Commit}, nil
 	case *tikvpb.BatchCommandsResponse_Response_Cleanup:
-		return &Response{Resp: res.Cleanup}
+		return &Response{Resp: res.Cleanup}, nil
 	case *tikvpb.BatchCommandsResponse_Response_BatchGet:
-		return &Response{Resp: res.BatchGet}
+		return &Response{Resp: res.BatchGet}, nil
 	case *tikvpb.BatchCommandsResponse_Response_BatchRollback:
-		return &Response{Resp: res.BatchRollback}
+		return &Response{Resp: res.BatchRollback}, nil
 	case *tikvpb.BatchCommandsResponse_Response_ScanLock:
-		return &Response{Resp: res.ScanLock}
+		return &Response{Resp: res.ScanLock}, nil
 	case *tikvpb.BatchCommandsResponse_Response_ResolveLock:
-		return &Response{Resp: res.ResolveLock}
+		return &Response{Resp: res.ResolveLock}, nil
 	case *tikvpb.BatchCommandsResponse_Response_GC:
-		return &Response{Resp: res.GC}
+		return &Response{Resp: res.GC}, nil
 	case *tikvpb.BatchCommandsResponse_Response_DeleteRange:
-		return &Response{Resp: res.DeleteRange}
+		return &Response{Resp: res.DeleteRange}, nil
 	case *tikvpb.BatchCommandsResponse_Response_RawGet:
-		return &Response{Resp: res.RawGet}
+		return &Response{Resp: res.RawGet}, nil
 	case *tikvpb.BatchCommandsResponse_Response_RawBatchGet:
-		return &Response{Resp: res.RawBatchGet}
+		return &Response{Resp: res.RawBatchGet}, nil
 	case *tikvpb.BatchCommandsResponse_Response_RawPut:
-		return &Response{Resp: res.RawPut}
+		return &Response{Resp: res.RawPut}, nil
 	case *tikvpb.BatchCommandsResponse_Response_RawBatchPut:
-		return &Response{Resp: res.RawBatchPut}
+		return &Response{Resp: res.RawBatchPut}, nil
 	case *tikvpb.BatchCommandsResponse_Response_RawDelete:
-		return &Response{Resp: res.RawDelete}
+		return &Response{Resp: res.RawDelete}, nil
 	case *tikvpb.BatchCommandsResponse_Response_RawBatchDelete:
-		return &Response{Resp: res.RawBatchDelete}
+		return &Response{Resp: res.RawBatchDelete}, nil
 	case *tikvpb.BatchCommandsResponse_Response_RawDeleteRange:
-		return &Response{Resp: res.RawDeleteRange}
+		return &Response{Resp: res.RawDeleteRange}, nil
 	case *tikvpb.BatchCommandsResponse_Response_RawScan:
-		return &Response{Resp: res.RawScan}
+		return &Response{Resp: res.RawScan}, nil
 	case *tikvpb.BatchCommandsResponse_Response_Coprocessor:
-		return &Response{Resp: res.Coprocessor}
+		return &Response{Resp: res.Coprocessor}, nil
 	case *tikvpb.BatchCommandsResponse_Response_PessimisticLock:
-		return &Response{Resp: res.PessimisticLock}
+		return &Response{Resp: res.PessimisticLock}, nil
 	case *tikvpb.BatchCommandsResponse_Response_PessimisticRollback:
-		return &Response{Resp: res.PessimisticRollback}
+		return &Response{Resp: res.PessimisticRollback}, nil
 	case *tikvpb.BatchCommandsResponse_Response_Empty:
-		return &Response{Resp: res.Empty}
+		return &Response{Resp: res.Empty}, nil
 	case *tikvpb.BatchCommandsResponse_Response_TxnHeartBeat:
-		return &Response{Resp: res.TxnHeartBeat}
+		return &Response{Resp: res.TxnHeartBeat}, nil
 	case *tikvpb.BatchCommandsResponse_Response_CheckTxnStatus:
-		return &Response{Resp: res.CheckTxnStatus}
+		return &Response{Resp: res.CheckTxnStatus}, nil
 	}
-	return nil
+	panic("unreachable")
 }
 
 // CopStreamResponse combinates tikvpb.Tikv_CoprocessorStreamClient and the first Recv() result together.
@@ -490,6 +501,14 @@ type CopStreamResponse struct {
 	*coprocessor.Response // The first result of Recv()
 	Timeout               time.Duration
 	Lease                 // Shared by this object and a background goroutine.
+}
+
+// BatchCopStreamResponse comprises the BatchCoprocessorClient , the first result and timeout detector.
+type BatchCopStreamResponse struct {
+	tikvpb.Tikv_BatchCoprocessorClient
+	*coprocessor.BatchResponse
+	Timeout time.Duration
+	Lease   // Shared by this object and a background goroutine.
 }
 
 // SetContext set the Context field for the given req to the specified ctx.
@@ -558,6 +577,8 @@ func SetContext(req *Request, region *metapb.Region, peer *metapb.Peer) error {
 		req.Cop().Context = ctx
 	case CmdCopStream:
 		req.Cop().Context = ctx
+	case CmdBatchCop:
+		req.BatchCop().Context = ctx
 	case CmdMvccGetByKey:
 		req.MvccGetByKey().Context = ctx
 	case CmdMvccGetByStartTs:
@@ -794,6 +815,12 @@ func CallRPC(ctx context.Context, client tikvpb.TikvClient, req *Request) (*Resp
 		resp.Resp = &CopStreamResponse{
 			Tikv_CoprocessorStreamClient: streamClient,
 		}
+	case CmdBatchCop:
+		var streamClient tikvpb.Tikv_BatchCoprocessorClient
+		streamClient, err = client.BatchCoprocessor(ctx, req.BatchCop())
+		resp.Resp = &BatchCopStreamResponse{
+			Tikv_BatchCoprocessorClient: streamClient,
+		}
 	case CmdMvccGetByKey:
 		resp.Resp, err = client.MvccGetByKey(ctx, req.MvccGetByKey())
 	case CmdMvccGetByStartTs:
@@ -847,6 +874,27 @@ func (resp *CopStreamResponse) Recv() (*coprocessor.Response, error) {
 
 // Close closes the CopStreamResponse object.
 func (resp *CopStreamResponse) Close() {
+	atomic.StoreInt64(&resp.Lease.deadline, 1)
+	// We also call cancel here because CheckStreamTimeoutLoop
+	// is not guaranteed to cancel all items when it exits.
+	if resp.Lease.Cancel != nil {
+		resp.Lease.Cancel()
+	}
+}
+
+// Recv overrides the stream client Recv() function.
+func (resp *BatchCopStreamResponse) Recv() (*coprocessor.BatchResponse, error) {
+	deadline := time.Now().Add(resp.Timeout).UnixNano()
+	atomic.StoreInt64(&resp.Lease.deadline, deadline)
+
+	ret, err := resp.Tikv_BatchCoprocessorClient.Recv()
+
+	atomic.StoreInt64(&resp.Lease.deadline, 0) // Stop the lease check.
+	return ret, errors.Trace(err)
+}
+
+// Close closes the CopStreamResponse object.
+func (resp *BatchCopStreamResponse) Close() {
 	atomic.StoreInt64(&resp.Lease.deadline, 1)
 	// We also call cancel here because CheckStreamTimeoutLoop
 	// is not guaranteed to cancel all items when it exits.
